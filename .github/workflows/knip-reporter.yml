@@ -5,9 +5,7 @@ on:
     workflows: ["Knip"]
     types:
       - completed
-
 permissions: write-all
-
 jobs:
   knip-reporter:
     runs-on: ubuntu-latest
@@ -18,16 +16,14 @@ jobs:
           name: knip-results
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Read pr number
         id: pr-number
         uses: juliangruber/read-file-action@v1
         with:
           path: ./pr-number.txt
           trim: true
-
       - name: Report knip results to pull request
-        uses: gitcoindev/knip-reporter@main
+        uses: ubiquity/knip-reporter@main
         with:
           verbose: true
           comment_id: ${{ github.workflow }}-reporter
@@ -38,3 +34,4 @@ jobs:
           json_input_file_name: knip-results.json
           pull_request_number: ${{ steps.pr-number.outputs.content }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
