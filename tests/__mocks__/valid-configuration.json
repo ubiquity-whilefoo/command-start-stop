@@ -1,14 +1,40 @@
 {
-  "reviewDelayTolerance": "1 Day",
-  "taskStaleTimeoutDuration": "30 Days",
-  "startRequiresWallet": true,
-  "maxConcurrentTasks": {
-    "admin": 20,
-    "member": 10,
-    "contributor": 2
-  },
   "assignedIssueScope": "org",
   "emptyWalletText": "Please set your wallet address with the /wallet command first and try again.",
+  "maxConcurrentTasks": {
+    "collaborator": 10,
+    "contributor": 2
+  },
+  "requiredLabelsToStart": [
+    {
+      "allowedRoles": ["collaborator", "contributor"],
+      "name": "Priority: 1 (Normal)"
+    },
+    {
+      "allowedRoles": ["collaborator", "contributor"],
+      "name": "Priority: 2 (Medium)"
+    },
+    {
+      "allowedRoles": ["collaborator", "contributor"],
+      "name": "Priority: 3 (High)"
+    },
+    {
+      "allowedRoles": ["collaborator", "contributor"],
+      "name": "Priority: 4 (Urgent)"
+    },
+    {
+      "allowedRoles": ["collaborator", "contributor"],
+      "name": "Priority: 5 (Emergency)"
+    }
+  ],
+  "reviewDelayTolerance": "1 Day",
   "rolesWithReviewAuthority": ["OWNER", "ADMIN", "MEMBER"],
-  "requiredLabelsToStart": ["Priority: 1 (Normal)", "Priority: 2 (Medium)", "Priority: 3 (High)", "Priority: 4 (Urgent)", "Priority: 5 (Emergency)"]
+  "startRequiresWallet": true,
+  "taskStaleTimeoutDuration": "30 Days",
+  "taskAccessControl": {
+    "usdPriceMax": {
+      "collaborator": "Infinity",
+      "contributor": 1000
+    }
+  }
 }

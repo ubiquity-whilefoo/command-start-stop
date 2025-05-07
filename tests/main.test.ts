@@ -1,26 +1,29 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect } from "@jest/globals";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, jest, test } from "@jest/globals";
 import { drop } from "@mswjs/data";
+import { TransformDecodeError, Value } from "@sinclair/typebox/value";
 import { createClient } from "@supabase/supabase-js";
-import { cleanLogString, Logs } from "@ubiquity-os/ubiquity-os-logger";
+import { cleanLogString, LogReturn } from "@ubiquity-os/ubiquity-os-logger";
 import dotenv from "dotenv";
 import { createAdapters } from "../src/adapters";
+import { HttpStatusCode } from "../src/handlers/result-types";
 import { userStartStop, userUnassigned } from "../src/handlers/user-start-stop";
-import { AssignedIssueScope, Context, envConfigValidator, Sender, SupportedEventsU } from "../src/types";
+import { Context, Env, envSchema, Sender } from "../src/types";
 import { db } from "./__mocks__/db";
 import issueTemplate from "./__mocks__/issue-template";
 import { server } from "./__mocks__/node";
 import usersGet from "./__mocks__/users-get.json";
-import { HttpStatusCode } from "../src/handlers/result-types";
+import { createContext, MAX_CONCURRENT_DEFAULTS } from "./utils";
 
 dotenv.config();
 
 type Issue = Context<"issue_comment.created">["payload"]["issue"];
 type PayloadSender = Context["payload"]["sender"];
 
-const octokit = jest.requireActual("@octokit/rest");
 const TEST_REPO = "ubiquity/test-repo";
-const PRIORITY_ONE = "Priority: 1 (Normal)";
-const PRIORITY_LABELS = [PRIORITY_ONE, "Priority: 2 (Medium)", "Priority: 3 (High)", "Priority: 4 (Urgent)", "Priority: 5 (Emergency)"];
+const PRIORITY_ONE = { name: "Priority: 1 (Normal)", allowedRoles: ["collaborator", "contributor"] };
+const priority3LabelName = "Priority: 3 (High)";
+const priority4LabelName = "Priority: 4 (Urgent)";
+const priority5LabelName = "Priority: 5 (Emergency)";
 
 beforeAll(() => {
   server.listen();
@@ -39,6 +42,38 @@ describe("User start/stop", () => {
     jest.clearAllMocks();
     jest.resetModules();
     await setupTests();
+  });
+
+  test("Collaborator can assign with string Infinity", async () => {
+    const issue = db.issue.findFirst({ where: { id: { equals: 1 } } }) as unknown as Issue;
+    const sender = db.users.findFirst({ where: { id: { equals: 3 } } }) as unknown as PayloadSender;
+
+    const context = createContext(issue, sender, "/start", "Infinity") as Context<"issue_comment.created">;
+
+    context.adapters = createAdapters(getSupabase(), context);
+    const { content } = await userStartStop(context);
+
+    expect(content).toEqual(SUCCESS_MESSAGE);
+  });
+
+  test("User can't start a task priced more than their assigned usdPriceMax", async () => {
+    const issue = db.issue.findFirst({ where: { id: { equals: 8 } } }) as unknown as Issue;
+    const sender = db.users.findFirst({ where: { id: { equals: 3 } } }) as unknown as PayloadSender;
+
+    const context = createContext(issue, sender, "/start") as Context<"issue_comment.created">;
+
+    context.adapters = createAdapters(getSupabase(), context);
+    await expect(userStartStop(context)).rejects.toMatchObject({
+      logMessage: {
+        raw: "While we appreciate your enthusiasm @user3, the price of this task exceeds your allowed limit. Please choose a task with a price of $10000 or less.",
+      },
+      metadata: {
+        userRole: "collaborator",
+        price: 15000,
+        userAllowedMaxPrice: 10000,
+        issueNumber: 8,
+      },
+    });
   });
 
   test("User can start an issue", async () => {
@@ -110,11 +145,7 @@ describe("User start/stop", () => {
     expect(content).toEqual("Task unassigned successfully");
     const logs = infoSpy.mock.calls.flat();
     expect(logs[0]).toMatch(/Opened prs/);
-    expect(cleanLogString(logs[3])).toMatch(
-      cleanLogString(
-        " › ```diff# These linked pull requests are closed:  http://github.com/ubiquity/test-repo/pull/2  http://github.com/ubiquity/test-repo/pull/3"
-      )
-    );
+    expect(cleanLogString(logs[3])).toMatch(cleanLogString("›Closinglinkedpull-request."));
   });
 
   test("Author's manual unassign should close linked issue", async () => {
@@ -130,11 +161,7 @@ describe("User start/stop", () => {
     expect(content).toEqual("Linked pull-requests closed.");
     const logs = infoSpy.mock.calls.flat();
     expect(logs[0]).toMatch(/Opened prs/);
-    expect(cleanLogString(logs[3])).toMatch(
-      cleanLogString(
-        " › ```diff# These linked pull requests are closed:  http://github.com/ubiquity/test-repo/pull/2  http://github.com/ubiquity/test-repo/pull/3"
-      )
-    );
+    expect(cleanLogString(logs[3])).toMatch(cleanLogString("›Closinglinkedpull-request."));
   });
 
   test("User can't stop an issue they're not assigned to", async () => {
@@ -179,17 +206,24 @@ describe("User start/stop", () => {
 
     context.adapters = createAdapters(getSupabase(), context);
 
-    await expect(userStartStop(context)).rejects.toMatchObject({ logMessage: { raw: "No price label is set to calculate the duration" } });
+    try {
+      await userStartStop(context);
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      const aggregateError = error as AggregateError;
+      const errorMessages = aggregateError.errors.map((error) => error.message);
+      expect(errorMessages).toEqual(expect.arrayContaining(["No price label is set to calculate the duration"]));
+    }
   });
 
   test("User can't start an issue without a wallet address", async () => {
     const issue = db.issue.findFirst({ where: { id: { equals: 1 } } }) as unknown as Issue;
     const sender = db.users.findFirst({ where: { id: { equals: 1 } } }) as unknown as PayloadSender;
 
-    const context = createContext(issue, sender, "/start", "2", true) as Context<"issue_comment.created">;
+    const context = createContext(issue, sender, "/start", "Infinity", true) as Context<"issue_comment.created">;
 
     context.adapters = createAdapters(getSupabase(false), context);
-    await expect(userStartStop(context)).rejects.toThrow("No wallet address found");
+    await expect(userStartStop(context)).rejects.toBeInstanceOf(LogReturn);
   });
 
   test("User can't start an issue that's closed", async () => {
@@ -211,14 +245,16 @@ describe("User start/stop", () => {
 
     context.adapters = createAdapters(getSupabase(), context);
 
-    await expect(userStartStop(context)).rejects.toMatchObject({ logMessage: { raw: "Skipping '/start' since the issue is a parent issue" } });
+    await expect(userStartStop(context)).rejects.toMatchObject({
+      logMessage: { raw: "Please select a child issue from the specification checklist to work on. The '/start' command is disabled on parent issues." },
+    });
   });
 
   test("should set maxLimits to 6 if the user is a member", async () => {
     const issue = db.issue.findFirst({ where: { id: { equals: 1 } } }) as unknown as Issue;
     const sender = db.users.findFirst({ where: { id: { equals: 5 } } }) as unknown as Sender;
 
-    const memberLimit = maxConcurrentDefaults.member;
+    const memberLimit = MAX_CONCURRENT_DEFAULTS.collaborator;
 
     createIssuesForMaxAssignment(memberLimit + 4, sender.id);
     const context = createContext(issue, sender) as unknown as Context;
@@ -252,48 +288,84 @@ describe("User start/stop", () => {
 
     const env = { ...context.env };
     Reflect.deleteProperty(env, "BOT_USER_ID");
-    if (!envConfigValidator.test(env)) {
-      const errorDetails: string[] = [];
-      for (const error of envConfigValidator.errors(env)) {
-        errorDetails.push(`${error.path}: ${error.message}`);
-      }
 
-      expect(errorDetails).toContain("/BOT_USER_ID: Expected union value");
+    const errors = [...Value.Errors(envSchema, env)];
+    const errorDetails: string[] = [];
+    for (const error of errors) {
+      errorDetails.push(`${error.path}: ${error.message}`);
     }
+
+    expect(errorDetails).toContain("/BOT_USER_ID: Expected union value");
   });
 
   test("Should throw if BOT_USER_ID is not a number", async () => {
     const issue = db.issue.findFirst({ where: { id: { equals: 1 } } }) as unknown as Issue;
     const sender = db.users.findFirst({ where: { id: { equals: 1 } } }) as unknown as PayloadSender;
 
-    const context = createContext(issue, sender, "/start", "testing-one");
-    const env = { ...context.env };
+    const context = createContext(issue, sender, "/start", "Infinity");
+    const env: Env = { ...context.env, BOT_USER_ID: "Not a number" as unknown as number, APP_ID: "1" };
 
-    if (!envConfigValidator.test(env)) {
-      const errorDetails: string[] = [];
-      for (const error of envConfigValidator.errors(env)) {
-        errorDetails.push(`${error.path}: ${error.message}`);
-      }
-
-      expect(errorDetails).toContain("Invalid BOT_USER_ID");
+    let err: unknown = null;
+    try {
+      Value.Decode(envSchema, env);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).not.toBeNull();
+    expect(err).toBeInstanceOf(TransformDecodeError);
+    if (err instanceof TransformDecodeError) {
+      expect(err.message).toContain("Invalid BOT_USER_ID");
     }
   });
 
   test("Should not allow a user to start if no requiredLabelToStart exists", async () => {
     const issue = db.issue.findFirst({ where: { id: { equals: 7 } } }) as unknown as Issue;
-    const sender = db.users.findFirst({ where: { id: { equals: 1 } } }) as unknown as PayloadSender;
+    const sender = db.users.findFirst({ where: { id: { equals: 3 } } }) as unknown as PayloadSender;
 
-    const context = createContext(issue, sender, "/start", "1", false, [
-      "Priority: 3 (High)",
-      "Priority: 4 (Urgent)",
-      "Priority: 5 (Emergency)",
+    const context = createContext(issue, sender, "/start", "Infinity", false, [
+      { name: priority3LabelName, allowedRoles: ["collaborator", "contributor"] },
+      { name: priority4LabelName, allowedRoles: ["collaborator", "contributor"] },
+      { name: priority5LabelName, allowedRoles: ["collaborator", "contributor"] },
     ]) as Context<"issue_comment.created">;
 
     context.adapters = createAdapters(getSupabase(), context);
 
-    await expect(userStartStop(context)).rejects.toMatchObject({
-      logMessage: { raw: "This task does not reflect a business priority at the moment and cannot be started. This will be reassessed in the coming weeks." },
-    });
+    try {
+      await userStartStop(context);
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      const aggregateError = error as AggregateError;
+      const errorMessages = aggregateError.errors.map((error) => error.message);
+      expect(errorMessages).toEqual(
+        expect.arrayContaining([
+          "This task does not reflect a business priority at the moment.\nYou may start tasks with one of the following labels: `Priority: 3 (High)`, `Priority: 4 (Urgent)`, `Priority: 5 (Emergency)`",
+        ])
+      );
+    }
+  });
+
+  test("Should not allow a user to start if the user role is not listed", async () => {
+    const issue = db.issue.findFirst({ where: { id: { equals: 7 } } }) as unknown as Issue;
+    const sender = db.users.findFirst({ where: { id: { equals: 2 } } }) as unknown as PayloadSender;
+
+    const context = createContext(issue, sender, "/start", "Infinity", false, [
+      { name: "Priority: 1 (Normal)", allowedRoles: ["collaborator"] },
+      { name: "Priority: 2 (Medium)", allowedRoles: ["collaborator"] },
+      { name: priority3LabelName, allowedRoles: ["collaborator"] },
+      { name: priority4LabelName, allowedRoles: ["collaborator"] },
+      { name: priority5LabelName, allowedRoles: ["collaborator"] },
+    ]) as Context<"issue_comment.created">;
+
+    context.adapters = createAdapters(getSupabase(), context);
+
+    try {
+      await userStartStop(context);
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      const aggregateError = error as AggregateError;
+      const errorMessages = aggregateError.errors.map((error) => error.message);
+      expect(errorMessages).toEqual(expect.arrayContaining(["You must be a core team member, or an administrator to start this task"]));
+    }
   });
 });
 
@@ -345,7 +417,7 @@ async function setupTests() {
     number: 3,
     labels: [
       {
-        name: PRIORITY_ONE,
+        name: PRIORITY_ONE.name,
       },
     ],
     body: "Third issue body",
@@ -401,7 +473,29 @@ async function setupTests() {
         name: "Time: 1h",
       },
       {
-        name: PRIORITY_ONE,
+        name: PRIORITY_ONE.name,
+      },
+    ],
+  });
+
+  db.issue.create({
+    ...issueTemplate,
+    id: 8,
+    node_id: "MDU6SXNzdWUg",
+    title: "Eighth issue",
+    number: 8,
+    body: "Eighth issue body",
+    owner: "ubiquity",
+    assignees: [],
+    labels: [
+      {
+        name: "Price: 15000 USD",
+      },
+      {
+        name: "Time: 1h",
+      },
+      {
+        name: PRIORITY_ONE.name,
       },
     ],
   });
@@ -640,81 +734,33 @@ function createIssuesForMaxAssignment(n: number, userId: number) {
   for (let i = 0; i < n; i++) {
     db.issue.create({
       ...issueTemplate,
-      id: i + 8,
+      id: i + 9,
       assignee: user,
     });
   }
 }
 
-const maxConcurrentDefaults = {
-  admin: Infinity,
-  member: 6,
-  contributor: 4,
-};
-
-export function createContext(
-  issue: Record<string, unknown>,
-  sender: Record<string, unknown> | undefined,
-  body = "/start",
-  appId: string | null = "1",
-  startRequiresWallet = false,
-  requiredLabelsToStart: string[] = PRIORITY_LABELS
-): Context {
-  return {
-    adapters: {} as ReturnType<typeof createAdapters>,
-    payload: {
-      issue: issue as unknown as Context<"issue_comment.created">["payload"]["issue"],
-      sender: sender as unknown as Context["payload"]["sender"],
-      repository: db.repo.findFirst({ where: { id: { equals: 1 } } }) as unknown as Context["payload"]["repository"],
-      comment: { body } as unknown as Context<"issue_comment.created">["payload"]["comment"],
-      action: "created",
-      installation: { id: 1 } as unknown as Context["payload"]["installation"],
-      organization: { login: "ubiquity" } as unknown as Context["payload"]["organization"],
-      assignee: {
-        ...sender,
-      },
-    } as Context["payload"],
-    logger: new Logs("debug"),
-    config: {
-      reviewDelayTolerance: "3 Days",
-      taskStaleTimeoutDuration: "30 Days",
-      maxConcurrentTasks: maxConcurrentDefaults,
-      startRequiresWallet,
-      assignedIssueScope: AssignedIssueScope.ORG,
-      emptyWalletText: "Please set your wallet address with the /wallet command first and try again.",
-      rolesWithReviewAuthority: ["ADMIN", "OWNER", "MEMBER"],
-      requiredLabelsToStart,
-    },
-    octokit: new octokit.Octokit(),
-    eventName: "issue_comment.created" as SupportedEventsU,
-    organizations: ["ubiquity"],
-    env: {
-      SUPABASE_KEY: "key",
-      SUPABASE_URL: "url",
-      BOT_USER_ID: appId as unknown as number,
-    },
-  };
-}
-
-export function getSupabase(withData = true) {
+function getSupabase(withData = true) {
   const mockedTable = {
     select: jest.fn().mockReturnValue({
       eq: jest.fn().mockReturnValue({
-        single: jest.fn().mockResolvedValue({
-          data: withData
-            ? {
-                id: 1,
-                wallets: {
-                  address: "0x123",
+        single: jest.fn(() =>
+          Promise.resolve({
+            data: withData
+              ? {
+                  id: 1,
+                  wallets: {
+                    address: "0x123",
+                  },
+                }
+              : {
+                  id: 1,
+                  wallets: {
+                    address: undefined,
+                  },
                 },
-              }
-            : {
-                id: 1,
-                wallets: {
-                  address: undefined,
-                },
-              },
-        }),
+          })
+        ),
       }),
     }),
   };

@@ -1,11 +1,32 @@
+import { createAppAuth } from "@octokit/auth-app";
 import { Repository } from "@octokit/graphql-schema";
-import { Context, isIssueCommentEvent, Label } from "../types";
+import { customOctokit } from "@ubiquity-os/plugin-sdk/octokit";
+import { Context, isIssueCommentEvent } from "../types";
 import { QUERY_CLOSING_ISSUE_REFERENCES } from "../utils/get-closing-issue-references";
-import { addCommentToIssue, closePullRequestForAnIssue, getOwnerRepoFromHtmlUrl } from "../utils/issue";
+import { closePullRequest, closePullRequestForAnIssue, getOwnerRepoFromHtmlUrl } from "../utils/issue";
 import { HttpStatusCode, Result } from "./result-types";
 import { getDeadline } from "./shared/generate-assignment-comment";
 import { start } from "./shared/start";
 import { stop } from "./shared/stop";
+
+export async function commandHandler(context: Context): Promise<Result> {
+  if (!isIssueCommentEvent(context)) {
+    return { status: HttpStatusCode.NOT_MODIFIED };
+  }
+  if (!context.command) {
+    return { status: HttpStatusCode.NOT_MODIFIED };
+  }
+  const { issue, sender, repository } = context.payload;
+
+  if (context.command.name === "stop") {
+    return await stop(context, issue, sender, repository);
+  } else if (context.command.name === "start") {
+    const teammates = context.command.parameters.teammates ?? [];
+    return await start(context, issue, sender, teammates);
+  } else {
+    return { status: HttpStatusCode.BAD_REQUEST };
+  }
+}
 
 export async function userStartStop(context: Context): Promise<Result> {
   if (!isIssueCommentEvent(context)) {
@@ -27,26 +48,6 @@ export async function userStartStop(context: Context): Promise<Result> {
   return { status: HttpStatusCode.NOT_MODIFIED };
 }
 
-export async function userSelfAssign(context: Context<"issues.assigned">): Promise<Result> {
-  const { payload } = context;
-  const { issue } = payload;
-  const deadline = getDeadline(issue.labels);
-
-  // We avoid posting a message if the bot is the actor to avoid double posting
-  if (!deadline || payload.sender.type === "Bot") {
-    context.logger.debug("Skipping deadline posting message.", {
-      senderType: payload.sender.type,
-      deadline: deadline,
-    });
-    return { status: HttpStatusCode.NOT_MODIFIED };
-  }
-
-  const users = issue.assignees.map((user) => `@${user?.login}`).join(", ");
-
-  await addCommentToIssue(context, `${users} the deadline is at ${deadline}`);
-  return { status: HttpStatusCode.OK };
-}
-
 export async function userPullRequest(context: Context<"pull_request.opened" | "pull_request.edited">): Promise<Result> {
   const { payload } = context;
   const { pull_request } = payload;
@@ -61,35 +62,75 @@ export async function userPullRequest(context: Context<"pull_request.opened" | "
     context.logger.info("No linked issues were found, nothing to do.");
     return { status: HttpStatusCode.NOT_MODIFIED };
   }
+
+  const appOctokit = new customOctokit({
+    authStrategy: createAppAuth,
+    auth: {
+      appId: context.env.APP_ID,
+      privateKey: context.env.APP_PRIVATE_KEY,
+    },
+  });
+
   for (const issue of issues) {
-    if (issue && !issue.assignees.nodes?.length) {
-      const labels =
-        issue.labels?.nodes?.reduce<Label[]>((acc, curr) => {
-          if (curr) {
-            acc.push({
-              ...curr,
-              id: Number(curr.id),
-              node_id: curr.id,
-              default: true,
-              description: curr.description ?? null,
-            });
-          }
-          return acc;
-        }, []) ?? [];
-      const deadline = getDeadline(labels);
-      if (!deadline) {
-        context.logger.debug("Skipping deadline posting message because no deadline has been set.");
-        return { status: HttpStatusCode.NOT_MODIFIED };
-      } else {
-        const issueWithComment: Context<"issue_comment.created">["payload"]["issue"] = {
-          ...issue,
-          assignees: issue.assignees.nodes as Context<"issue_comment.created">["payload"]["issue"]["assignees"],
-          labels,
-          html_url: issue.url,
-        } as unknown as Context<"issue_comment.created">["payload"]["issue"];
-        context.payload = Object.assign({ issue: issueWithComment }, context.payload);
-        return await start(context, issueWithComment, payload.sender, []);
-      }
+    if (!issue || issue.assignees.nodes?.length) {
+      continue;
+    }
+
+    const installation = await appOctokit.rest.apps.getRepoInstallation({
+      owner: issue.repository.owner.login,
+      repo: issue.repository.name,
+    });
+    const repoOctokit = new customOctokit({
+      authStrategy: createAppAuth,
+      auth: {
+        appId: Number(context.env.APP_ID),
+        privateKey: context.env.APP_PRIVATE_KEY,
+        installationId: installation.data.id,
+      },
+    });
+
+    const linkedIssue = (
+      await repoOctokit.rest.issues.get({
+        owner: issue.repository.owner.login,
+        repo: issue.repository.name,
+        issue_number: issue.number,
+      })
+    ).data as Context<"issue_comment.created">["payload"]["issue"];
+    const deadline = getDeadline(linkedIssue.labels);
+    if (!deadline) {
+      context.logger.debug("Skipping deadline posting message because no deadline has been set.");
+      return { status: HttpStatusCode.NOT_MODIFIED };
+    }
+
+    const repository = (
+      await repoOctokit.rest.repos.get({
+        owner: issue.repository.owner.login,
+        repo: issue.repository.name,
+      })
+    ).data as Context<"issue_comment.created">["payload"]["repository"];
+    let organization: Context<"issue_comment.created">["payload"]["organization"] | undefined = undefined;
+    if (repository.owner.type === "Organization") {
+      organization = (
+        await repoOctokit.rest.orgs.get({
+          org: issue.repository.owner.login,
+        })
+      ).data;
+    }
+    const newContext = {
+      ...context,
+      octokit: repoOctokit,
+      payload: {
+        ...context.payload,
+        issue: linkedIssue,
+        repository,
+        organization,
+      },
+    };
+    try {
+      return await start(newContext, linkedIssue, pull_request.user ?? payload.sender, []);
+    } catch (error) {
+      await closePullRequest(context, { number: pull_request.number });
+      throw error;
     }
   }
   return { status: HttpStatusCode.NOT_MODIFIED };

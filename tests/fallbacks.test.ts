@@ -1,4 +1,5 @@
-import { RestEndpointMethodTypes } from "@octokit/rest";
+import { jest } from "@jest/globals";
+import { RestEndpointMethodTypes } from "@octokit/plugin-rest-endpoint-methods";
 import { Logs } from "@ubiquity-os/ubiquity-os-logger";
 import { Context } from "../src/types/context";
 import { getAllPullRequestsWithRetry } from "../src/utils/issue";
@@ -11,13 +12,13 @@ const mockPullRequestData = [
 ] as unknown as RestEndpointMethodTypes["pulls"]["list"]["response"]["data"];
 
 const mockOctokit = {
-  paginate: jest.fn().mockResolvedValue(mockPullRequestData),
+  paginate: jest.fn(() => mockPullRequestData),
   rest: {
     pulls: {
-      list: jest.fn().mockResolvedValue(mockPullRequestData),
+      list: jest.fn(() => mockPullRequestData),
     },
     repos: {
-      listForOrg: jest.fn().mockResolvedValue(mockPullRequestData),
+      listForOrg: jest.fn(() => mockPullRequestData),
     },
   },
 };

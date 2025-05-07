@@ -1,4 +1,4 @@
-import { RestEndpointMethodTypes } from "@octokit/rest";
+import { RestEndpointMethodTypes } from "@octokit/plugin-rest-endpoint-methods";
 
 export type Issue = RestEndpointMethodTypes["issues"]["get"]["response"]["data"];
 export type Label = RestEndpointMethodTypes["issues"]["listLabelsOnIssue"]["response"]["data"][0];
@@ -7,7 +7,6 @@ export type TimelineEventResponse = RestEndpointMethodTypes["issues"]["listEvent
 export type TimelineEvents = RestEndpointMethodTypes["issues"]["listEventsForTimeline"]["response"]["data"][0];
 export type Assignee = Issue["assignee"];
 export type GitHubIssueSearch = RestEndpointMethodTypes["search"]["issuesAndPullRequests"]["response"]["data"];
-export type RepoIssues = RestEndpointMethodTypes["issues"]["listForRepo"]["response"]["data"];
 
 export type AssignedIssue = {
   title: string;

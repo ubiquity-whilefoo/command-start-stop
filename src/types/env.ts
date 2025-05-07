@@ -1,9 +1,10 @@
 import { Type as T } from "@sinclair/typebox";
 import { StaticDecode } from "@sinclair/typebox";
-import { StandardValidator } from "typebox-validators";
 
 const ERROR_MSG = "Invalid BOT_USER_ID";
 export const envSchema = T.Object({
+  APP_ID: T.String({ minLength: 1 }),
+  APP_PRIVATE_KEY: T.String({ minLength: 1 }),
   SUPABASE_URL: T.String(),
   SUPABASE_KEY: T.String(),
   BOT_USER_ID: T.Transform(T.Union([T.String(), T.Number()], { examples: 123456 }))
@@ -25,7 +26,8 @@ export const envSchema = T.Object({
       }
       throw new Error(ERROR_MSG);
     }),
+  KERNEL_PUBLIC_KEY: T.Optional(T.String()),
+  LOG_LEVEL: T.Optional(T.String()),
 });
 
 export type Env = StaticDecode<typeof envSchema>;
-export const envConfigValidator = new StandardValidator(envSchema);

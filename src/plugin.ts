@@ -1,40 +1,22 @@
-import { paginateGraphQL } from "@octokit/plugin-paginate-graphql";
-import { Octokit } from "@octokit/rest";
 import { createClient } from "@supabase/supabase-js";
-import { LogReturn, Logs } from "@ubiquity-os/ubiquity-os-logger";
 import { createAdapters } from "./adapters";
-import { userPullRequest, userSelfAssign, userStartStop, userUnassigned } from "./handlers/user-start-stop";
-import { Context, Env, PluginInputs } from "./types";
-import { addCommentToIssue } from "./utils/issue";
+import { HttpStatusCode } from "./handlers/result-types";
+import { commandHandler, userPullRequest, userStartStop, userUnassigned } from "./handlers/user-start-stop";
+import { Context } from "./types";
 import { listOrganizations } from "./utils/list-organizations";
 
-export async function startStopTask(inputs: PluginInputs, env: Env) {
-  const customOctokit = Octokit.plugin(paginateGraphQL);
-  const octokit = new customOctokit({ auth: inputs.authToken });
-  const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_KEY);
-
-  const context: Context = {
-    eventName: inputs.eventName,
-    payload: inputs.eventPayload,
-    config: inputs.settings,
-    organizations: [],
-    octokit,
-    env,
-    logger: new Logs("info"),
-    adapters: {} as ReturnType<typeof createAdapters>,
-  };
-
-  context.adapters = createAdapters(supabase, context);
+export async function startStopTask(context: Context) {
+  context.adapters = createAdapters(createClient(context.env.SUPABASE_URL, context.env.SUPABASE_KEY), context as Context);
+  context.organizations = await listOrganizations(context);
 
   try {
-    const organizations = await listOrganizations(context);
-    context.organizations = organizations;
+    if (context.command) {
+      return await commandHandler(context);
+    }
 
     switch (context.eventName) {
       case "issue_comment.created":
-        return await userStartStop(context);
-      case "issues.assigned":
-        return await userSelfAssign(context as Context<"issues.assigned">);
+        return await userStartStop(context as Context<"issue_comment.created">);
       case "pull_request.opened":
         return await userPullRequest(context as Context<"pull_request.opened">);
       case "pull_request.edited":
@@ -43,18 +25,9 @@ export async function startStopTask(inputs: PluginInputs, env: Env) {
         return await userUnassigned(context as Context<"issues.unassigned">);
       default:
         context.logger.error(`Unsupported event: ${context.eventName}`);
+        return { status: HttpStatusCode.BAD_REQUEST };
     }
-  } catch (err) {
-    let errorMessage;
-    if (err instanceof LogReturn) {
-      errorMessage = err;
-      await addCommentToIssue(context, `${errorMessage?.logMessage.diff}\n<!--\n${sanitizeMetadata(errorMessage?.metadata)}\n-->`);
-    } else {
-      context.logger.error("An error occurred", { err });
-    }
+  } catch (error) {
+    throw error instanceof AggregateError ? context.logger.warn(error.errors.map((err) => err.message).join("\n\n"), { error }) : error;
   }
-}
-
-function sanitizeMetadata(obj: LogReturn["metadata"]): string {
-  return JSON.stringify(obj, null, 2).replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/--/g, "&#45;&#45;");
 }

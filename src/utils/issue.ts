@@ -1,18 +1,18 @@
-import { RestEndpointMethodTypes } from "@octokit/rest";
+import { RestEndpointMethodTypes } from "@octokit/plugin-rest-endpoint-methods";
 import { Endpoints } from "@octokit/types";
 import ms from "ms";
+import { AssignedIssueScope, Role } from "../types";
 import { Context } from "../types/context";
-import { GitHubIssueSearch, RepoIssues, Review } from "../types/payload";
+import { GitHubIssueSearch, Review } from "../types/payload";
 import { getLinkedPullRequests, GetLinkedResults } from "./get-linked-prs";
 import { getAllPullRequestsFallback, getAssignedIssuesFallback } from "./get-pull-requests-fallback";
-import { AssignedIssueScope } from "../types";
 
 export function isParentIssue(body: string) {
   const parentPattern = /-\s+\[( |x)\]\s+#\d+/;
   return body.match(parentPattern);
 }
 
-export async function getAssignedIssues(context: Context, username: string): Promise<GitHubIssueSearch["items"] | RepoIssues> {
+export async function getAssignedIssues(context: Context, username: string) {
   let repoOrgQuery = "";
   if (context.config.assignedIssueScope === AssignedIssueScope.REPO) {
     repoOrgQuery = `repo:${context.payload.repository.full_name}`;
@@ -38,41 +38,21 @@ export async function getAssignedIssues(context: Context, username: string): Pro
   }
 }
 
-export async function addCommentToIssue(context: Context, message: string | null) {
-  if (!message) {
-    context.logger.error("Message is not defined");
-    return;
-  }
-
-  if (!("issue" in context.payload)) {
-    context.logger.error("Cannot post without a referenced issue.");
-    return;
-  }
-  const { payload } = context;
-
-  try {
-    await context.octokit.rest.issues.createComment({
-      owner: payload.repository.owner.login,
-      repo: payload.repository.name,
-      issue_number: payload.issue.number,
-      body: message,
-    });
-  } catch (err: unknown) {
-    throw new Error(context.logger.error("Adding a comment failed!", { error: err as Error }).logMessage.raw);
-  }
-}
-
 // Pull Requests
 
-export async function closePullRequest(context: Context, results: GetLinkedResults) {
+export async function closePullRequest(context: Context, results: Pick<GetLinkedResults, "number">) {
   const { payload } = context;
+  const params: RestEndpointMethodTypes["pulls"]["update"]["parameters"] = {
+    owner: payload.repository.owner.login,
+    repo: payload.repository.name,
+    pull_number: results.number,
+    state: "closed",
+  };
+  context.logger.info("Closing linked pull-request.", {
+    params,
+  });
   try {
-    await context.octokit.rest.pulls.update({
-      owner: payload.repository.owner.login,
-      repo: payload.repository.name,
-      pull_number: results.number,
-      state: "closed",
-    });
+    await context.octokit.rest.pulls.update(params);
   } catch (err: unknown) {
     throw new Error(context.logger.error("Closing pull requests failed!", { error: err as Error }).logMessage.raw);
   }
@@ -157,7 +137,7 @@ async function confirmMultiAssignment(context: Context, issueNumber: number, use
     const log = logger.info("This task belongs to a private repo and can only be assigned to one user without an official paid GitHub subscription.", {
       issueNumber,
     });
-    await addCommentToIssue(context, log?.logMessage.diff as string);
+    await context.commentHandler.postComment(context, log);
   }
 }
 
@@ -172,7 +152,7 @@ export async function addAssignees(context: Context, issueNo: number, assignees:
       assignees,
     });
   } catch (e: unknown) {
-    throw new Error(context.logger.error("Adding the assignee failed", { assignee: assignees, issueNo, error: e as Error }).logMessage.raw);
+    throw context.logger.error("Adding the assignee failed", { assignee: assignees, issueNo, error: e as Error });
   }
 
   await confirmMultiAssignment(context, issueNo, assignees);
@@ -227,7 +207,7 @@ export async function getAllPullRequestReviews(context: Context, pullNumber: num
         pull_number: pullNumber,
         per_page: 100,
       })
-    ).filter((review) => rolesWithReviewAuthority.includes(review.author_association)) as Review[];
+    ).filter((review) => rolesWithReviewAuthority.includes(review.author_association as Role)) as Review[];
   } catch (err) {
     if (err && typeof err === "object" && "status" in err && err.status === 404) {
       return [];
@@ -248,7 +228,62 @@ export function getOwnerRepoFromHtmlUrl(url: string) {
   };
 }
 
-export async function getAvailableOpenedPullRequests(context: Context, username: string) {
+async function getReviewByUser(context: Context, pullRequest: Awaited<ReturnType<typeof getOpenedPullRequestsForUser>>[0]) {
+  const { owner, repo } = getOwnerRepoFromHtmlUrl(pullRequest.html_url);
+  const reviews = (await getAllPullRequestReviews(context, pullRequest.number, owner, repo)).sort((a, b) => {
+    if (!a?.submitted_at || !b?.submitted_at) {
+      return 0;
+    }
+    return new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime();
+  });
+  const latestReviewsByUser: Map<number, Review> = new Map();
+  for (const review of reviews) {
+    const isReviewRequestedForUser =
+      "requested_reviewers" in pullRequest && pullRequest.requested_reviewers && pullRequest.requested_reviewers.some((o) => o.id === review.user?.id);
+    if (!isReviewRequestedForUser && review.user?.id && !latestReviewsByUser.has(review.user?.id)) {
+      latestReviewsByUser.set(review.user?.id, review);
+    }
+  }
+
+  return latestReviewsByUser;
+}
+
+async function shouldSkipPullRequest(
+  context: Context,
+  pullRequest: Awaited<ReturnType<typeof getOpenedPullRequestsForUser>>[0],
+  reviews: Awaited<ReturnType<typeof getReviewByUser>>,
+  { owner, repo, issueNumber }: { owner: string; repo: string; issueNumber: number },
+  reviewDelayTolerance: string
+) {
+  const timeline = await context.octokit.paginate(context.octokit.rest.issues.listEventsForTimeline, {
+    owner,
+    repo,
+    issue_number: issueNumber,
+  });
+  const reviewEvent = timeline.filter((o) => o.event === "review_requested").pop();
+  const referenceTime = reviewEvent && "created_at" in reviewEvent ? new Date(reviewEvent.created_at).getTime() : new Date(pullRequest.created_at).getTime();
+
+  // If no reviews exist, check time reference
+  if (reviews.size === 0) {
+    return new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
+  }
+
+  // If changes are requested, do not skip
+  if (Array.from(reviews.values()).some((review) => review.state === "CHANGES_REQUESTED")) {
+    return true;
+  }
+
+  // If no approvals exist or time reference has exceeded review delay tolerance
+  const hasApproval = Array.from(reviews.values()).some((review) => review.state === "APPROVED");
+  const isTimePassed = new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
+
+  return hasApproval || !isTimePassed;
+}
+
+/**
+ * Returns all the pull-requests pending approval, which count negatively against the PR author's quota.
+ */
+export async function getPendingOpenedPullRequests(context: Context, username: string) {
   const { reviewDelayTolerance } = context.config;
   if (!reviewDelayTolerance) return [];
 
@@ -259,16 +294,15 @@ export async function getAvailableOpenedPullRequests(context: Context, username:
     const openedPullRequest = openedPullRequests[i];
     if (!openedPullRequest) continue;
     const { owner, repo } = getOwnerRepoFromHtmlUrl(openedPullRequest.html_url);
-    const reviews = await getAllPullRequestReviews(context, openedPullRequest.number, owner, repo);
-
-    if (reviews.length > 0) {
-      const approvedReviews = reviews.find((review) => review.state === "APPROVED");
-      if (approvedReviews) {
-        result.push(openedPullRequest);
-      }
-    }
-
-    if (reviews.length === 0 && new Date().getTime() - new Date(openedPullRequest.created_at).getTime() >= getTimeValue(reviewDelayTolerance)) {
+    const latestReviewsByUser = await getReviewByUser(context, openedPullRequest);
+    const shouldSkipPr = await shouldSkipPullRequest(
+      context,
+      openedPullRequest,
+      latestReviewsByUser,
+      { owner, repo, issueNumber: openedPullRequest.number },
+      reviewDelayTolerance
+    );
+    if (!shouldSkipPr) {
       result.push(openedPullRequest);
     }
   }
